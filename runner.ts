@@ -1,119 +1,143 @@
-// The kit's runner (MIT): keep it as it is. main.ts hands a trial over to runTrial when MAKEFUN_ENV_URL is set:
+// runner: the trial side of mend.
 //
-//   GET  $MAKEFUN_ENV_URL/checks    the checks: {"checks": [{"id", "argv", "stdin", "files"}], "answered", "total"}
-//   POST $MAKEFUN_ENV_URL/results   {"results": [{"id", "exit", "stdout", "files"}]}: taken whole or refused whole
+// The grader runs `node /bot/main.ts` with MAKEFUN_ENV_URL set. This
+// module then fetches the trial's checks from the env, runs node main.ts
+// on each one in a fresh directory holding exactly that check's files
+// (with the check's standard input and without MAKEFUN_ENV_URL), and
+// posts every result back. A result is final once the env accepts it.
 //
-// runTrial runs main.ts on each check (runCheck), one at a time in the env's order, posts the results ten at a time and
-// returns. A request that fails on the network (the env closing an idle connection as the next post goes out) is sent
-// again, up to RETRIES times: a POST whose first send landed is answered 409 (already answered) the second time, which
-// is taken as sent. runCheck runs main.ts the way SPEC.md's checks expect: `node main.ts <argv>` in a fresh directory holding
-// exactly the check's files, with the check's standard input (null: none, so empty) and without MAKEFUN_ENV_URL, and
-// returns its exit code, its stdout and every regular file in the directory afterwards. check.ts runs it on the
-// practice set on your own machine. Node 22, the standard library alone; it calls no model and needs no key.
+// Env API (see the trial prompt): GET $MAKEFUN_ENV_URL/checks lists the
+// checks; POST $MAKEFUN_ENV_URL/results takes {results: [{id, exit,
+// stdout, files}]}. Each run has 10 seconds; one still running then is
+// stopped and reported as exit 124.
 
-import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { dirname, join, relative, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { spawn } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
-/** One check: the CLI's arguments, its standard input and the files it starts with. */
-export interface Check {
+type Check = {
   id: string;
   argv: string[];
   stdin: string | null;
   files: Record<string, string>;
+};
+
+type RunResult = { exit: number; stdout: string; files: Record<string, string> };
+
+const RUN_TIMEOUT_MS = 10_000;
+
+function envBase(u: string): string {
+  return u.endsWith("/") ? u.slice(0, -1) : u;
 }
 
-/** What the CLI did. */
-export interface Result {
-  id: string;
-  exit: number;
-  stdout: string;
-  files: Record<string, string>;
+async function getChecks(base: string): Promise<Check[]> {
+  const res = await fetch(`${base}/checks`);
+  if (!res.ok) throw new Error(`GET /checks -> ${res.status}`);
+  const data = (await res.json()) as { checks: Check[] };
+  if (!Array.isArray(data.checks)) throw new Error("GET /checks: no checks list");
+  return data.checks;
 }
 
-/** The CLI this repository builds, beside this file. */
-export const MAIN = join(dirname(fileURLToPath(import.meta.url)), 'main.ts');
-
-/** A run longer than this is stopped and reported as exit 124. */
-export const TIMEOUT_MS = 10_000;
-/** The env takes at most this much stdout and this many files a result. */
-export const MAX_STDOUT_BYTES = 64 * 1024;
-export const MAX_FILES = 64;
-/** Results posted at a time, and how often a request that failed on the network is sent again. */
-export const BATCH = 10;
-export const RETRIES = 4;
-
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
-
-/** fetch, sent again after a network error (never after an answer, whatever its status). */
-async function send(url: string, init?: RequestInit): Promise<Response> {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      return await fetch(url, init);
-    } catch (err) {
-      if (attempt >= RETRIES) throw err;
-      await sleep(250 * (attempt + 1));
-    }
+function writeTree(dir: string, files: Record<string, string>): void {
+  for (const [rel, text] of Object.entries(files)) {
+    const dest = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.writeFileSync(dest, text, "utf8");
   }
 }
 
+// Every regular file in the directory afterwards, paths relative to it
+// with "/" between segments, each with its text.
 function readTree(dir: string): Record<string, string> {
   const out: Record<string, string> = {};
-  const walk = (d: string): void => {
-    for (const name of readdirSync(d)) {
-      const p = join(d, name);
-      const st = statSync(p);
-      if (st.isDirectory()) walk(p);
-      else if (st.isFile() && Object.keys(out).length < MAX_FILES) out[relative(dir, p).split(sep).join('/')] = readFileSync(p, 'utf8');
+  const walk = (d: string, prefix: string): void => {
+    for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
+      const full = path.join(d, entry.name);
+      const rel = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+      if (entry.isDirectory()) walk(full, rel);
+      else if (entry.isFile()) out[rel] = fs.readFileSync(full, "utf8");
     }
   };
-  walk(dir);
+  walk(dir, "");
   return out;
 }
 
-/** Run main.ts (or `program`) on one check. */
-export function runCheck(c: Check, program = MAIN): Result {
-  const dir = mkdtempSync(join(tmpdir(), 'mend-'));
-  try {
-    for (const [p, text] of Object.entries(c.files)) {
-      const f = join(dir, ...p.split('/'));
-      mkdirSync(dirname(f), { recursive: true });
-      writeFileSync(f, text);
+function runOne(mainTs: string, check: Check): Promise<RunResult> {
+  return new Promise((resolve) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mend-check-"));
+    try {
+      writeTree(dir, check.files);
+    } catch {
+      // A malformed file list still gets its run; the check fails on its
+      // own rather than hanging the trial.
     }
-    const env = { ...process.env };
-    delete env.MAKEFUN_ENV_URL;
-    const r = spawnSync(process.execPath, [program, ...c.argv], { cwd: dir, env, input: c.stdin ?? '', encoding: 'utf8', timeout: TIMEOUT_MS, maxBuffer: 4 * MAX_STDOUT_BYTES });
-    const exit = r.error !== undefined || r.status === null ? 124 : r.status;
-    let stdout = r.stdout ?? '';
-    while (Buffer.byteLength(stdout, 'utf8') > MAX_STDOUT_BYTES) stdout = stdout.slice(0, Math.floor(stdout.length / 2));
-    return { id: c.id, exit, stdout, files: readTree(dir) };
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+    // The child must not see MAKEFUN_ENV_URL: with it set, main.ts would
+    // hand over to this runner again instead of running the CLI.
+    const env: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) {
+      if (v !== undefined) env[k] = v;
+    }
+    delete env["MAKEFUN_ENV_URL"];
+    const child = spawn(process.execPath, [mainTs, ...check.argv], {
+      cwd: dir,
+      env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let settled = false;
+    const finish = (exit: number): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      let files: Record<string, string> = {};
+      try {
+        files = readTree(dir);
+      } catch {
+        files = {};
+      }
+      resolve({ exit, stdout, files });
+    };
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Already gone.
+      }
+      finish(124);
+    }, RUN_TIMEOUT_MS);
+    child.stdout.on("data", (d: Buffer) => {
+      stdout += d.toString("utf8");
+    });
+    child.on("error", () => finish(124));
+    child.on("close", (code) => finish(code ?? 124));
+    if (check.stdin !== null) child.stdin.write(check.stdin);
+    child.stdin.end();
+  });
 }
 
-/** A trial: every check of the env at `envUrl` run and its result posted. */
 export async function runTrial(envUrl: string): Promise<void> {
-  const base = envUrl.replace(/\/+$/, '');
-  const post = async (results: Result[]): Promise<void> => {
-    const res = await send(`${base}/results`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ results }) });
-    // Every answer's body is read, so no connection is left holding the process open once the trial is done.
-    const body = await res.text();
-    if (!res.ok && res.status !== 409) throw new Error(`POST /results answered ${res.status}: ${body}`);
-  };
-  const res = await send(`${base}/checks`);
-  if (!res.ok) throw new Error(`GET /checks answered ${res.status}`);
-  const { checks } = (await res.json()) as { checks: Check[] };
-  let batch: Result[] = [];
-  for (const c of checks) {
-    batch.push(runCheck(c));
-    if (batch.length === BATCH) {
-      await post(batch);
-      batch = [];
-    }
+  const base = envBase(envUrl);
+  const checks = await getChecks(base);
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const mainTs = path.join(here, "main.ts");
+  const results: { id: string; exit: number; stdout: string; files: Record<string, string> }[] = [];
+  for (const check of checks) {
+    const r = await runOne(mainTs, check);
+    results.push({ id: check.id, exit: r.exit, stdout: r.stdout, files: r.files });
   }
-  if (batch.length > 0) await post(batch);
-  process.stdout.write(`posted ${checks.length} results\n`);
+  const res = await fetch(`${base}/results`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ results }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`POST /results -> ${res.status} ${text}`);
+  }
+  const data = (await res.json()) as { accepted?: string[]; left?: number };
+  process.stderr.write(
+    `runner: posted ${results.length} results, accepted ${(data.accepted ?? []).length}, left ${data.left ?? "?"}\n`,
+  );
 }
